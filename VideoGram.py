@@ -9,7 +9,8 @@ import io
 import re
 import requests  # Para descargar subtítulos y miniatura
 import threading  # Para manejar la cancelación en hilos
-
+from ast import literal_eval
+import logging
 import yt_dlp
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -50,12 +51,9 @@ logging.basicConfig(
 
 
 # ──────────────────────────────────────────────#
-# CONFIGURACIÓN (HARDCODEADA)
+# CONFIGURACIÓN 
 # ──────────────────────────────────────────────#
-API_ID = 
-API_HASH = ""
-BOT_TOKEN = ""
-ALLOWED_USERS = [123456789, 123456789]
+from config import API_ID, API_HASH, BOT_TOKEN, ALLOWED_USERS
 
 # ──────────────────────────────────────────────#
 # CONFIGURACIÓN DEL LOGGING
@@ -77,6 +75,7 @@ logging.basicConfig(
 lock_descarga = asyncio.Lock()
 video_links = {}
 info_cache = {}  # Para almacenar la info extraída de cada URL
+video_device_os = {}  # Almacena la elección del sistema operativo por video_id
 download_cancel_flags = {}  # Diccionario para almacenar los flags de cancelación (video_id -> threading.Event)
 
 # ──────────────────────────────────────────────#
@@ -100,6 +99,68 @@ async def update_message_text(message: Message, text: str, reply_markup=None):
         else:
             logging.error(f"Error al actualizar el mensaje: {e}")
 
+@bot.on_message(filters.command("id"))
+async def add_user_command(client, message):
+    # Definir quién es administrador. En este ejemplo, asumimos que el primer ID en ALLOWED_USERS es el admin.
+    admin_id = ALLOWED_USERS[0]
+    if message.from_user.id != admin_id:
+        await message.reply("No tienes permiso para usar este comando.")
+        return
+
+    # Se espera el formato: /id <user_id>
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.reply("Uso correcto: /id <user_id>")
+        return
+
+    try:
+        new_user_id = int(parts[1])
+    except ValueError:
+        await message.reply("El ID debe ser un número válido.")
+        return
+
+    if new_user_id in ALLOWED_USERS:
+        await message.reply("El usuario ya está registrado.")
+        return
+
+    # Actualiza en memoria la lista de ALLOWED_USERS
+    ALLOWED_USERS.append(new_user_id)
+    ALLOWED_USERS.sort()
+
+    # Actualiza el archivo config.py para que el cambio sea persistente
+    if update_config_allowed_users(new_user_id):
+        await message.reply(f"Usuario {new_user_id} añadido correctamente.")
+    else:
+        await message.reply("Error al actualizar el archivo de configuración.")
+
+def update_config_allowed_users(new_user_id):
+    try:
+        # Construye la ruta absoluta al archivo config.py
+        config_path = os.path.join(os.path.dirname(__file__), "config.py")
+        with open(config_path, "r", encoding="utf-8") as f:
+            config_content = f.read()
+        # Patrón para encontrar la línea donde se define ALLOWED_USERS (lista)
+        pattern = r"^\s*(ALLOWED_USERS\s*=\s*)(\[[^\]]*\])"
+        match = re.search(pattern, config_content, re.MULTILINE)
+        if not match:
+            logging.error("No se encontró la línea de ALLOWED_USERS en config.py")
+            return False
+        prefix, current_list_str = match.groups()
+        # Evalúa de forma segura el contenido actual
+        current_list = literal_eval(current_list_str)
+        if new_user_id in current_list:
+            return False  # El usuario ya está registrado
+        current_list.append(new_user_id)
+        current_list = sorted(current_list)
+        new_list_str = "[" + ", ".join(str(x) for x in current_list) + "]"
+        new_config_content = re.sub(pattern, prefix + new_list_str, config_content, flags=re.MULTILINE)
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(new_config_content)
+        return True
+    except Exception as e:
+        logging.error("Error actualizando config.py: %s", e)
+        return False
+
 def make_progress_hook(message: Message, loop, cancel_flag, cancel_markup, threshold: float = 5.0, min_interval: float = 3.0):
     last_percentage = [0.0]
     last_update_time = [0.0]
@@ -121,7 +182,7 @@ def make_progress_hook(message: Message, loop, cancel_flag, cancel_markup, thres
                     last_percentage[0] = percentage
                     last_update_time[0] = now
                     filled = int(total_segments * percentage / 100)
-                    bar = "🟩" * filled + "⬜" * (total_segments - filled)
+                    bar = "🟥" * filled + "⬜" * (total_segments - filled)
                     downloaded_mb = downloaded / (1024 * 1024)
                     total_mb = total / (1024 * 1024)
                     speed = progress.get("speed", 0)
@@ -153,7 +214,7 @@ def make_upload_progress_hook(message: Message, loop, threshold: float = 5.0, mi
                 last_percentage[0] = percentage
                 last_update_time[0] = now
                 filled = int(total_segments * percentage / 100)
-                bar = "🟩" * filled + "⬜" * (total_segments - filled)
+                bar = "🟥" * filled + "⬜" * (total_segments - filled)
                 new_text = f"⏫ Subiendo: {percentage:.2f}%\n{bar}"
                 loop.call_soon_threadsafe(lambda: asyncio.create_task(update_message_text(message, new_text)))
         except Exception as e:
@@ -278,7 +339,7 @@ def estimar_tiempo_subida(tamano_archivo_mb: float, velocidad_subida_mbps: float
     minutos, segundos = divmod(int(tiempo_estimado), 60)
     return f"{minutos} min {segundos} s" if minutos else f"{segundos} s"
 
-async def descargar_video(url: str, calidad: str, message: Message, cancel_flag, cancel_markup):
+async def descargar_video(url: str, calidad: str, message: Message, cancel_flag, cancel_markup, device_os="android"):
     try:
         file_id = hashlib.md5(url.encode()).hexdigest()[:10]
         temp_filename = f"downloads/temp_{file_id}.mp4"
@@ -311,7 +372,103 @@ async def descargar_video(url: str, calidad: str, message: Message, cancel_flag,
                 os.replace(f"{temp_filename}.mp3", output_filename)
         else:
             if os.path.exists(temp_filename):
-                os.replace(temp_filename, output_filename)
+                import itertools
+                spinner = itertools.cycle(['|', '/', '-', '\\'])  # Spinner para simular actividad
+
+                # Dentro del bloque de recodificación para iOS:
+                if device_os == "ios":
+                    file_size = os.path.getsize(temp_filename)
+                    if file_size > 2000 * 1024 * 1024:
+                        await update_message_text(message, "🚫 **El video excede el límite de 2000MB y no se puede recodificar para iOS.**", reply_markup=None)
+                        os.remove(temp_filename)
+                        return None
+                    # Usar ffprobe para obtener la duración real del archivo temp_filename
+                    proc = await asyncio.create_subprocess_exec(
+                        'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                        '-of', 'default=noprint_wrappers=1:nokey=1', temp_filename,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, _ = await proc.communicate()
+                    try:
+                        duration_sec = float(stdout.decode().strip())
+                    except Exception as e:
+                        logging.error(f"Error obteniendo duración con ffprobe: {e}")
+                        duration_sec = 0
+                    total_duration_ms = int(duration_sec * 1000)
+                    if total_duration_ms < 1000:
+                        info_local = extraer_info(url, "video")
+                        fallback_duration_sec = info_local.get("duration", 0)
+                        total_duration_ms = int(fallback_duration_sec * 1000)
+                    if total_duration_ms < 1000:
+                        total_duration_ms = 1000
+                    total_segments = 17
+                    logging.info(f"Duración total usada: {total_duration_ms} ms")
+
+                    process = await asyncio.create_subprocess_exec(
+                        'ffmpeg',
+                        '-init_hw_device', 'qsv=hw:0',
+                        '-filter_hw_device', 'hw',
+                        '-hwaccel', 'qsv',
+                        '-i', temp_filename,
+                        '-c:v', 'h264_qsv',
+                        '-rc_mode', 'icq',            # Modo ICQ para control de tasa
+                        '-global_quality', '20',      # Ajusta este valor: valores más altos comprimen más (con menor calidad)
+                        '-c:a', 'copy',
+                        '-movflags', '+faststart',
+                        '-progress', 'pipe:1',
+                        '-y', output_filename,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+
+                    last_update_time = 0
+                    while True:
+                        # Comprobar si se ha pulsado Cancelar
+                        if cancel_flag.is_set():
+                            process.kill()  # Terminar el proceso de ffmpeg
+                            await update_message_text(message, "❌ Recodificación cancelada por el usuario.", reply_markup=None)
+                            return None
+
+                        line = await process.stdout.readline()
+                        if not line:
+                            break
+                        line_str = line.decode('utf-8').strip()
+                        if line_str.startswith("out_time_us=") or line_str.startswith("out_time_ms="):
+                            try:
+                                if line_str.startswith("out_time_us="):
+                                    current_ms = int(line_str.split("=")[1]) // 1000
+                                else:
+                                    current_ms = int(line_str.split("=")[1])
+                                porcentaje = (current_ms / total_duration_ms) * 100 if total_duration_ms else 0
+                                if porcentaje > 100:
+                                    porcentaje = 100
+                                # Actualizar solo si han pasado al menos 3 segundos
+                                current_time = time.time()
+                                if current_time - last_update_time < 3:
+                                    continue
+                                last_update_time = current_time
+
+                                filled = int(total_segments * porcentaje / 100)
+                                bar = "🟦" * filled + "⬜" * (total_segments - filled)
+                                new_text = f"Re-codificando para 🍏: {porcentaje:.2f}% completado\n{bar}"
+                                await update_message_text(message, new_text, reply_markup=cancel_markup)
+                            except Exception as e:
+                                logging.error(f"Error al parsear progreso: {e}")
+                        elif line_str.startswith("progress=") and line_str == "progress=end":
+                            new_text = f"Re-codificando: 100.00% completado\n{'🟦' * total_segments}"
+                            await update_message_text(message, new_text, reply_markup=None)
+                            break
+                    await process.wait()
+                    if process.returncode != 0:
+                        await update_message_text(message, "❌ **Error en la recodificación del video usando QSV.**")
+                        return None
+
+
+
+                else:
+                    # Para Android no es necesaria la recodificación
+                    os.replace(temp_filename, output_filename)
         if os.path.exists(temp_filename):
             os.remove(temp_filename)
         return output_filename
@@ -443,20 +600,69 @@ async def handle_download_request(_, message: Message):
     if not resoluciones:
         await message.reply_text("❌ **No se encontraron resoluciones disponibles o el enlace no es válido.**")
         return
+    # Se obtiene el video_id y se almacena el enlace
+    video_id = hashlib.md5(url.encode()).hexdigest()[:10]
+    video_links[video_id] = url
+    video_device_os[video_id] = None  # Inicialmente sin selección de SO
+
+    # Solicitar la selección del sistema operativo
+    os_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤖 Android", callback_data=f"os|{video_id}|android"),
+         InlineKeyboardButton("🍏 iOS", callback_data=f"os|{video_id}|ios")]
+    ])
+    await message.reply_text(
+        "Por favor, selecciona tu dispositivo:\n\nElige 'Android' si usas Android o 'iOS' si usas un dispositivo Apple.",
+        reply_markup=os_markup
+    )
+
+@bot.on_callback_query(filters.regex(r"^os\|(.+)$"))
+async def handle_os_selection(_, callback_query: Message):
+    data = callback_query.data.split("|")
+    video_id = data[1]
+    device = data[2]
+    video_device_os[video_id] = device
+    
+    url = video_links.get(video_id)
+    if not url:
+        await callback_query.message.edit_text("❌ Error: No se encontró el video.")
+        return
+    
+    info = extraer_info(url, "video")
+    if not info:
+        await callback_query.message.edit_text("❌ Error al analizar la información del video.")
+        return
+    
+    if "entries" in info and len(info["entries"]) > 1:
+        playlist_notice = f"⚠️ Se han detectado {len(info['entries'])} videos en la publicación.\nSe descargarán todos con la resolución elegida."
+    else:
+        playlist_notice = ""
+    
+    resoluciones = obtener_resoluciones(url)
+    if resoluciones == "LIVE_BLOCKED":
+        await callback_query.message.edit_text("🚫 No es posible descargar transmisiones en vivo de YouTube.")
+        return
+    if not resoluciones:
+        await callback_query.message.edit_text("❌ No se encontraron resoluciones disponibles o el enlace no es válido.")
+        return
+    
     extra_buttons = []
     if info:
         if info.get("subtitles") or info.get("automatic_captions"):
-            extra_buttons.append([InlineKeyboardButton("📝 Subtítulos", callback_data=f"sub|{hashlib.md5(url.encode()).hexdigest()[:10]}")])
+            extra_buttons.append([InlineKeyboardButton("📝 Subtítulos", callback_data=f"sub|{video_id}")])
         if "thumbnail" in info:
-            extra_buttons.append([InlineKeyboardButton("🖼️ Miniatura", callback_data=f"thumb|{hashlib.md5(url.encode()).hexdigest()[:10]}")])
-    video_id = hashlib.md5(url.encode()).hexdigest()[:10]
-    video_links[video_id] = url
+            extra_buttons.append([InlineKeyboardButton("🖼️ Miniatura", callback_data=f"thumb|{video_id}")])
+    
     botones = [[InlineKeyboardButton(f"📺 {res}", callback_data=f"dl|{video_id}|{res}")]
                for res in resoluciones]
     botones.append([InlineKeyboardButton("🎵 Solo Audio (MP3)", callback_data=f"dl|{video_id}|audio")])
     if extra_buttons:
         botones.extend(extra_buttons)
-    await message.reply_text(f"📥 **Elige una opción:**\n{playlist_notice}", reply_markup=InlineKeyboardMarkup(botones))
+    
+    await callback_query.message.edit_text(
+        f"📥 **Elige una opción:**\n{playlist_notice}",
+        reply_markup=InlineKeyboardMarkup(botones)
+    )
+
 
 @bot.on_callback_query(filters.regex(r"^(dl|sub|thumb)\|"))
 async def handle_download_callback(_, callback_query: Message):
@@ -478,6 +684,9 @@ async def handle_download_callback(_, callback_query: Message):
             cancel_flag = threading.Event()
             cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("Cancelar", callback_data=f"cancel|{video_id}")]])
             download_cancel_flags[video_id] = cancel_flag
+
+            # Recupera la elección del sistema operativo (default "android" si no se seleccionó)
+            device_os = video_device_os.get(video_id, "android")
 
             async with lock_descarga:
                 info = extraer_info(url, "video")
@@ -508,7 +717,7 @@ async def handle_download_callback(_, callback_query: Message):
                         if tamano_video_mb > 2048:
                             await callback_query.message.edit_text(f"🚫 **El video {idx} excede el límite de 2 GB y será omitido.**")
                             continue
-                        video_path = await descargar_video(entry_url, calidad, callback_query.message, cancel_flag, cancel_markup)
+                        video_path = await descargar_video(entry_url, calidad, callback_query.message, cancel_flag, cancel_markup, device_os)
                         if not video_path:
                             continue
                         tamano_archivo_mb = os.path.getsize(video_path) / (1024 * 1024)
@@ -543,7 +752,7 @@ async def handle_download_callback(_, callback_query: Message):
                         if video_id in download_cancel_flags:
                             del download_cancel_flags[video_id]
                         return
-                    video_path = await descargar_video(url, calidad, callback_query.message, cancel_flag, cancel_markup)
+                    video_path = await descargar_video(url, calidad, callback_query.message, cancel_flag, cancel_markup, device_os)
                     if not video_path:
                         return
                     tamano_archivo_mb = os.path.getsize(video_path) / (1024 * 1024)
@@ -618,6 +827,7 @@ async def handle_download_callback(_, callback_query: Message):
         except Exception as e:
             logging.error(f"❌ Error al descargar la miniatura: {e}")
             await callback_query.message.edit_text(f"❌ **Error al descargar la miniatura:** {str(e)}")
+
 
 @bot.on_callback_query(filters.regex(r"^cancel\|(.+)$"))
 async def handle_cancel_callback(_, callback_query: Message):
